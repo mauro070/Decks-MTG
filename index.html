@@ -662,6 +662,8 @@
     #scanVideo { width: 100%; height: auto; display: block; }
     .scan-guide { position: absolute; left: 5%; width: 90%; top: 40%; height: 18%; border: 2px solid #E7B75F; border-radius: 6px; box-shadow: 0 0 0 100vmax rgba(0,0,0,0.35); }
     .scan-guide span { position: absolute; top: -22px; left: 0; font-size: 12px; color: #E7B75F; white-space: nowrap; }
+    .scan-lang { display: flex; align-items: center; gap: 8px; margin-top: 12px; font-size: 13px; color: #cfc7b5; }
+    .scan-lang select { flex: 1; background: #201a12; color: #eee; border: 1px solid #55493099; border-radius: 8px; padding: 8px; font-size: 14px; }
     .scan-status { min-height: 18px; font-size: 13px; color: #cfc7b5; margin-top: 10px; text-align: center; }
     .scan-actions { display: flex; gap: 10px; margin-top: 12px; }
     .scan-actions .btn { flex: 1; }
@@ -671,6 +673,22 @@
       <div class="scan-video-wrap">
         <video id="scanVideo" playsinline autoplay muted></video>
         <div class="scan-guide"><span>Encuadrá el NOMBRE de la carta acá</span></div>
+      </div>
+      <div class="scan-lang">
+        <label for="scanLang">Idioma de la carta:</label>
+        <select id="scanLang">
+          <option value="eng">Inglés</option>
+          <option value="spa">Español</option>
+          <option value="deu">Alemán</option>
+          <option value="fra">Francés</option>
+          <option value="ita">Italiano</option>
+          <option value="por">Portugués</option>
+          <option value="rus">Ruso</option>
+          <option value="jpn">Japonés</option>
+          <option value="kor">Coreano</option>
+          <option value="chi_sim">Chino (simplificado)</option>
+          <option value="chi_tra">Chino (tradicional)</option>
+        </select>
       </div>
       <div id="scanStatus" class="scan-status"></div>
       <div class="scan-actions">
@@ -904,7 +922,7 @@
 
     // ---------- Escaneo de carta (cámara + OCR) ----------
     let scanStream = null;
-    let ocrWorker = null;
+    const ocrWorkers = {}; // caché de workers de Tesseract por idioma
 
     function loadTesseract() {
       return new Promise((resolve, reject) => {
@@ -915,6 +933,12 @@
         s.onerror = () => reject(new Error("No se pudo cargar el OCR"));
         document.head.appendChild(s);
       });
+    }
+
+    async function getWorker(lang) {
+      await loadTesseract();
+      if (!ocrWorkers[lang]) ocrWorkers[lang] = await Tesseract.createWorker(lang);
+      return ocrWorkers[lang];
     }
 
     function stopScanStream() {
@@ -945,47 +969,58 @@
       const v = $("scanVideo");
       if (!v || !v.videoWidth) { $("scanStatus").textContent = "Esperá a que enfoque…"; return; }
       const btn = $("scanCaptureBtn");
+      const lang = ($("scanLang") && $("scanLang").value) || "eng";
       btn.disabled = true;
-      $("scanStatus").textContent = "Leyendo…";
+      $("scanStatus").textContent = "Cargando idioma / leyendo…";
       try {
-        await loadTesseract();
         const W = v.videoWidth, H = v.videoHeight;
         // banda central = la franja del nombre (coincide con la guía)
         const sx = Math.round(W * 0.05), sw = Math.round(W * 0.90);
         const sy = Math.round(H * 0.40), sh = Math.round(H * 0.18);
-        const scale = 2; // agrandar para mejor OCR
+        const scale = 2;
         const c = document.createElement("canvas");
         c.width = sw * scale; c.height = sh * scale;
         const ctx = c.getContext("2d");
         ctx.drawImage(v, sx, sy, sw, sh, 0, 0, c.width, c.height);
-        // escala de grises + umbral suave
+        // escala de grises SIN umbral duro (preserva los trazos de CJK/cirílico)
         const img = ctx.getImageData(0, 0, c.width, c.height);
         const px = img.data;
         for (let i = 0; i < px.length; i += 4) {
-          let g = 0.3 * px[i] + 0.59 * px[i + 1] + 0.11 * px[i + 2];
-          g = g > 145 ? 255 : (g < 85 ? 0 : g);
+          const g = 0.3 * px[i] + 0.59 * px[i + 1] + 0.11 * px[i + 2];
           px[i] = px[i + 1] = px[i + 2] = g;
         }
         ctx.putImageData(img, 0, 0);
 
-        if (!ocrWorker) ocrWorker = await Tesseract.createWorker("eng");
-        const { data } = await ocrWorker.recognize(c);
-        const text = (data && data.text ? data.text : "").trim();
-        let line = text.split("\n").map((s) => s.trim()).find((s) => /[A-Za-z]/.test(s)) || "";
-        line = line.replace(/[^A-Za-z',\- ]/g, "").replace(/\s+/g, " ").trim();
+        const worker = await getWorker(lang);
+        const { data } = await worker.recognize(c);
+        const text = data && data.text ? data.text : "";
+        // primera línea con contenido real (cualquier alfabeto), sin puntuación en los bordes
+        let raw = text.split("\n").map((s) => s.trim()).filter(Boolean)[0] || "";
+        raw = raw.replace(/^[^\p{L}\p{N}]+/u, "").replace(/[^\p{L}\p{N}]+$/u, "").trim();
 
-        if (!line || line.length < 3) {
-          $("scanStatus").textContent = "No pude leer el nombre. Probá con más luz y la carta derecha.";
+        if (!raw) {
+          $("scanStatus").textContent = "No pude leer el nombre. Más luz y encuadrá solo el título.";
           btn.disabled = false;
           return;
         }
-        // cerrar cámara y pasar el texto al buscador existente
+
+        // Scryfall named?fuzzy resuelve el nombre en CUALQUIER idioma → carta (en inglés).
+        $("scanStatus").textContent = "Buscando en Scryfall…";
+        let card = null;
+        try { card = await fetchJson(`${SCRYFALL}/cards/named?fuzzy=${encodeURIComponent(raw)}`); } catch (_) {}
+
         stopScanStream();
         $("scanDialog").close();
         const el = $("cardName");
-        el.value = line;
-        el.dispatchEvent(new Event("input", { bubbles: true }));
-        $("cardStatus").textContent = 'Leí: "' + line + '" — revisá la sugerencia y confirmá.';
+        if (card && card.name) {
+          el.value = card.name;
+          el.dispatchEvent(new Event("input", { bubbles: true }));
+          $("cardStatus").textContent = 'Detecté: "' + card.name + '". Revisá y confirmá.';
+        } else {
+          el.value = raw;
+          el.dispatchEvent(new Event("input", { bubbles: true }));
+          $("cardStatus").textContent = 'Leí: "' + raw + '" — no lo encontré exacto, editá o reintentá.';
+        }
       } catch (e) {
         $("scanStatus").textContent = "Error de OCR: " + (e && e.message ? e.message : e);
       } finally {
