@@ -633,6 +633,7 @@
         <label for="cardName">Nombre de la carta</label>
         <input id="cardName" autocomplete="off" placeholder="Ej: Sol Ring" />
         <div id="cardSuggestions" class="suggestions"></div>
+        <button type="button" class="btn" id="scanBtn" onclick="openScanner()" style="margin:8px 0; width:100%;">📷 Escanear carta con la cámara</button>
 
         <label for="cardCode">Código de identificación</label>
         <input id="cardCode" autocomplete="off" placeholder="Ej: war 014" />
@@ -646,6 +647,33 @@
           <button type="submit" class="btn primary">Confirmar</button>
         </div>
       </form>
+    </div>
+  </dialog>
+
+  <!-- ── Escáner de carta (cámara + OCR) ── -->
+  <style>
+    #scanDialog { border: none; border-radius: 14px; padding: 0; max-width: 96vw; width: 460px; background: #14110c; color: #eee; }
+    #scanDialog::backdrop { background: rgba(0,0,0,0.7); }
+    .scan-inner { position: relative; padding: 14px; }
+    .scan-video-wrap { position: relative; width: 100%; border-radius: 10px; overflow: hidden; background: #000; }
+    #scanVideo { width: 100%; height: auto; display: block; }
+    .scan-guide { position: absolute; left: 5%; width: 90%; top: 40%; height: 18%; border: 2px solid #E7B75F; border-radius: 6px; box-shadow: 0 0 0 100vmax rgba(0,0,0,0.35); }
+    .scan-guide span { position: absolute; top: -22px; left: 0; font-size: 12px; color: #E7B75F; white-space: nowrap; }
+    .scan-status { min-height: 18px; font-size: 13px; color: #cfc7b5; margin-top: 10px; text-align: center; }
+    .scan-actions { display: flex; gap: 10px; margin-top: 12px; }
+    .scan-actions .btn { flex: 1; }
+  </style>
+  <dialog id="scanDialog">
+    <div class="scan-inner">
+      <div class="scan-video-wrap">
+        <video id="scanVideo" playsinline autoplay muted></video>
+        <div class="scan-guide"><span>Encuadrá el NOMBRE de la carta acá</span></div>
+      </div>
+      <div id="scanStatus" class="scan-status"></div>
+      <div class="scan-actions">
+        <button type="button" class="btn" onclick="closeScanner()">Cancelar</button>
+        <button type="button" class="btn primary" id="scanCaptureBtn" onclick="captureAndOCR()">Capturar</button>
+      </div>
     </div>
   </dialog>
 
@@ -869,7 +897,98 @@
       setTimeout(() => $("cardName").focus(), 60);
     }
 
-    function closeCardDialog() { $("cardDialog").close(); }
+    function closeCardDialog() { stopScanStream(); $("cardDialog").close(); }
+
+    // ---------- Escaneo de carta (cámara + OCR) ----------
+    let scanStream = null;
+    let ocrWorker = null;
+
+    function loadTesseract() {
+      return new Promise((resolve, reject) => {
+        if (window.Tesseract) return resolve();
+        const s = document.createElement("script");
+        s.src = "https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js";
+        s.onload = () => resolve();
+        s.onerror = () => reject(new Error("No se pudo cargar el OCR"));
+        document.head.appendChild(s);
+      });
+    }
+
+    function stopScanStream() {
+      if (scanStream) { scanStream.getTracks().forEach((t) => t.stop()); scanStream = null; }
+      const v = $("scanVideo"); if (v) v.srcObject = null;
+    }
+
+    async function openScanner() {
+      $("scanStatus").textContent = "";
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        alert("Este dispositivo/navegador no permite usar la cámara.");
+        return;
+      }
+      try {
+        scanStream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: "environment" } } });
+      } catch (e) {
+        alert("No pude acceder a la cámara. Revisá los permisos.");
+        return;
+      }
+      $("scanVideo").srcObject = scanStream;
+      if (!$("scanDialog").open) $("scanDialog").showModal();
+      loadTesseract().catch(() => {}); // precarga en segundo plano
+    }
+
+    function closeScanner() { stopScanStream(); $("scanDialog").close(); }
+
+    async function captureAndOCR() {
+      const v = $("scanVideo");
+      if (!v || !v.videoWidth) { $("scanStatus").textContent = "Esperá a que enfoque…"; return; }
+      const btn = $("scanCaptureBtn");
+      btn.disabled = true;
+      $("scanStatus").textContent = "Leyendo…";
+      try {
+        await loadTesseract();
+        const W = v.videoWidth, H = v.videoHeight;
+        // banda central = la franja del nombre (coincide con la guía)
+        const sx = Math.round(W * 0.05), sw = Math.round(W * 0.90);
+        const sy = Math.round(H * 0.40), sh = Math.round(H * 0.18);
+        const scale = 2; // agrandar para mejor OCR
+        const c = document.createElement("canvas");
+        c.width = sw * scale; c.height = sh * scale;
+        const ctx = c.getContext("2d");
+        ctx.drawImage(v, sx, sy, sw, sh, 0, 0, c.width, c.height);
+        // escala de grises + umbral suave
+        const img = ctx.getImageData(0, 0, c.width, c.height);
+        const px = img.data;
+        for (let i = 0; i < px.length; i += 4) {
+          let g = 0.3 * px[i] + 0.59 * px[i + 1] + 0.11 * px[i + 2];
+          g = g > 145 ? 255 : (g < 85 ? 0 : g);
+          px[i] = px[i + 1] = px[i + 2] = g;
+        }
+        ctx.putImageData(img, 0, 0);
+
+        if (!ocrWorker) ocrWorker = await Tesseract.createWorker("eng");
+        const { data } = await ocrWorker.recognize(c);
+        const text = (data && data.text ? data.text : "").trim();
+        let line = text.split("\n").map((s) => s.trim()).find((s) => /[A-Za-z]/.test(s)) || "";
+        line = line.replace(/[^A-Za-z',\- ]/g, "").replace(/\s+/g, " ").trim();
+
+        if (!line || line.length < 3) {
+          $("scanStatus").textContent = "No pude leer el nombre. Probá con más luz y la carta derecha.";
+          btn.disabled = false;
+          return;
+        }
+        // cerrar cámara y pasar el texto al buscador existente
+        stopScanStream();
+        $("scanDialog").close();
+        const el = $("cardName");
+        el.value = line;
+        el.dispatchEvent(new Event("input", { bubbles: true }));
+        $("cardStatus").textContent = 'Leí: "' + line + '" — revisá la sugerencia y confirmá.';
+      } catch (e) {
+        $("scanStatus").textContent = "Error de OCR: " + (e && e.message ? e.message : e);
+      } finally {
+        btn.disabled = false;
+      }
+    }
 
     // ---------- Core actions ----------
 
