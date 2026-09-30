@@ -595,6 +595,9 @@
 
       <h1 id="screenTitle">Mazos</h1>
       <span class="ornament">✦</span>
+      <button id="exportBtn" class="back-btn" title="Exportar backup (JSON)">⬇</button>
+      <button id="importBtn" class="back-btn" title="Importar backup (JSON)">⬆</button>
+      <input id="importFile" type="file" accept="application/json,.json" style="display:none" />
     </header>
 
     <main id="content"></main>
@@ -1398,12 +1401,13 @@ async function showStorageEstimate() {
     // ---------- Backup / Restore ----------
 
 function bindBackupEvents() {
-  $("exportBtn").addEventListener("click", exportBackup);
-  $("importBtn").addEventListener("click", () => $("importFile").click());
-
-  $("importFile").addEventListener("change", async (e) => {
-    await importBackupFile(e);
-  });
+  // Guardas por si algún botón no está en el DOM (evita romper el init y que no se dibujen los mazos).
+  const eb = $("exportBtn");
+  if (eb) eb.addEventListener("click", exportBackup);
+  const ib = $("importBtn");
+  if (ib) ib.addEventListener("click", () => { const f = $("importFile"); if (f) f.click(); });
+  const inp = $("importFile");
+  if (inp) inp.addEventListener("change", async (e) => { await importBackupFile(e); });
 }
 
 async function exportBackup() {
