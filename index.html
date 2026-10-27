@@ -532,6 +532,61 @@
       color: var(--gold-light);
     }
 
+    .small-btn.is-online {
+      box-shadow: 0 0 8px rgba(42, 157, 143, 0.6);
+      border-color: #2a9d8f;
+      color: #5eead4;
+    }
+    .small-btn.is-syncing {
+      animation: spin 1s infinite linear;
+    }
+    @keyframes spin {
+      from { transform: rotate(0deg); }
+      to { transform: rotate(360deg); }
+    }
+    .sync-status-box {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 10px 14px;
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      margin-bottom: 12px;
+      font-size: 14px;
+    }
+    .sync-dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      background: #888;
+      display: inline-block;
+      transition: background 0.3s, box-shadow 0.3s;
+    }
+    .sync-dot.is-online {
+      background: #2a9d8f;
+      box-shadow: 0 0 8px rgba(42, 157, 143, 0.7);
+    }
+    .sync-dot.is-offline {
+      background: #e63946;
+    }
+    .sync-info-text {
+      font-size: 12px;
+      color: var(--muted);
+      margin-bottom: 16px;
+      font-style: italic;
+    }
+    .dialog-btn-list {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+    .dialog-btn-list .btn {
+      width: 100%;
+      text-align: center;
+      padding: 11px 16px;
+    }
+
     .hint {
       color: var(--muted);
       font-size: 13px;
@@ -595,8 +650,9 @@
 
       <h1 id="screenTitle">Mazos</h1>
       <span class="ornament">✦</span>
-      <button id="exportBtn" class="back-btn" title="Exportar backup (JSON)">⬇</button>
-      <button id="importBtn" class="back-btn" title="Importar backup (JSON)">⬆</button>
+      <button id="syncBtn" class="small-btn" title="Sincronizar con Homelab">☁</button>
+      <button id="exportBtn" class="small-btn" title="Exportar backup (JSON)">⬇</button>
+      <button id="importBtn" class="small-btn" title="Importar backup (JSON)">⬆</button>
       <input id="importFile" type="file" accept="application/json,.json" style="display:none" />
     </header>
 
@@ -735,7 +791,7 @@
       await loadDecks();
       await loadCardNameCache();
       bindEvents();
-      bindBackupEvents();
+      bindSyncEvents();
       renderHome();
       setupBackButtonHandler();
     }
@@ -1435,6 +1491,255 @@ async function showStorageEstimate() {
 }
     // ---------- Backup / Restore ----------
 
+const HOMELAB_MTG_API = "https://mauro.taild9dcef.ts.net:8444/api/mtg";
+const HOMELAB_HEALTH = "https://mauro.taild9dcef.ts.net:8444/api/health";
+
+async function checkHomelabStatus() {
+  const dot = $("mtgSyncDot");
+  const text = $("mtgSyncStatusText");
+  const btn = $("syncBtn");
+  try {
+    const res = await fetch(HOMELAB_HEALTH, { mode: "cors", signal: AbortSignal.timeout(2500) });
+    if (res.ok) {
+      if (dot) dot.className = "sync-dot is-online";
+      if (text) text.textContent = "Homelab conectado (Tailscale)";
+      if (btn) btn.classList.add("is-online");
+      return true;
+    }
+  } catch (_) {}
+  if (dot) dot.className = "sync-dot is-offline";
+  if (text) text.textContent = "Homelab no disponible (revisá Tailscale)";
+  if (btn) btn.classList.remove("is-online");
+  return false;
+}
+
+async function getBackupPayload() {
+  const decks = await getAllRecords("decks");
+  const cards = await getAllRecords("cards");
+
+  const exportDecks = [];
+  for (const deck of decks) {
+    exportDecks.push({
+      ...deck,
+      commanderImageBlob: await blobToDataURL(deck.commanderImageBlob)
+    });
+  }
+
+  const exportCards = [];
+  for (const card of cards) {
+    exportCards.push({
+      ...card,
+      imageBlob: await blobToDataURL(card.imageBlob)
+    });
+  }
+
+  return {
+    app: "mtg-deck-image-app",
+    version: 1,
+    exportedAt: new Date().toISOString(),
+    decks: exportDecks,
+    cards: exportCards
+  };
+}
+
+async function restoreFromPayload(backup) {
+  if (backup.app !== "mtg-deck-image-app") {
+    throw new Error("Formato de backup inválido.");
+  }
+
+  const currentCards = await getAllRecords("cards");
+  for (const card of currentCards) {
+    await deleteRecord("cards", card.id);
+  }
+
+  const currentDecks = await getAllRecords("decks");
+  for (const deck of currentDecks) {
+    await deleteRecord("decks", deck.id);
+  }
+
+  for (const deck of backup.decks || []) {
+    await putRecord("decks", {
+      ...deck,
+      commanderImageBlob: await dataURLToBlob(deck.commanderImageBlob)
+    });
+  }
+
+  for (const card of backup.cards || []) {
+    await putRecord("cards", {
+      ...card,
+      imageBlob: await dataURLToBlob(card.imageBlob)
+    });
+  }
+
+  await loadDecks();
+  renderHome();
+}
+
+async function pushToHomelab(isManual = false) {
+  const btn = $("btnPushToHomelab");
+  const syncBtn = $("syncBtn");
+  if (btn) btn.disabled = true;
+  if (syncBtn) syncBtn.classList.add("is-syncing");
+
+  try {
+    const isOnline = await checkHomelabStatus();
+    if (!isOnline) {
+      if (isManual) alert("No se pudo conectar al Homelab. Asegurate de tener Tailscale activo.");
+      return false;
+    }
+
+    const payload = await getBackupPayload();
+    const res = await fetch(HOMELAB_MTG_API, {
+      method: "POST",
+      mode: "cors",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload)
+    });
+
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    const data = await res.json();
+    if (isManual) {
+      alert(`¡Copia subida con éxito!\n${data.decks_count || 0} mazos y ${data.cards_count || 0} cartas respaldados en tu Homelab.`);
+    }
+    return true;
+  } catch (err) {
+    console.error("Error subiendo a Homelab:", err);
+    if (isManual) alert("Error al subir copia al Homelab: " + err.message);
+    return false;
+  } finally {
+    if (btn) btn.disabled = false;
+    if (syncBtn) syncBtn.classList.remove("is-syncing");
+  }
+}
+
+async function pullFromHomelab() {
+  const btn = $("btnPullFromHomelab");
+  const syncBtn = $("syncBtn");
+  if (btn) btn.disabled = true;
+  if (syncBtn) syncBtn.classList.add("is-syncing");
+
+  try {
+    const isOnline = await checkHomelabStatus();
+    if (!isOnline) {
+      alert("No se pudo conectar al Homelab. Asegurate de tener Tailscale activo.");
+      return;
+    }
+
+    const res = await fetch(HOMELAB_MTG_API, { mode: "cors", signal: AbortSignal.timeout(6000) });
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    const data = await res.json();
+
+    if (!data.decks || !data.decks.length) {
+      alert("El Homelab todavía no tiene ningún mazo guardado. Podés subir tus mazos actuales con el botón 'Subir mazos al Homelab'.");
+      return;
+    }
+
+    const count = data.decks.length;
+    const cardsCount = data.cards?.length || 0;
+    const dateStr = data.updatedAt ? new Date(data.updatedAt).toLocaleString() : "desconocida";
+
+    if (!confirm(`El servidor tiene ${count} mazo(s) y ${cardsCount} carta(s) (Guardado: ${dateStr}).\n\n¿Querés restaurar esta versión en tu celular?\n(Esto reemplazará la lista local por la del servidor)`)) {
+      return;
+    }
+
+    await restoreFromPayload(data);
+    alert("¡Mazos restaurados exitosamente desde el Homelab!");
+    const syncDialog = $("syncDialog");
+    if (syncDialog) syncDialog.close();
+  } catch (err) {
+    console.error("Error descargando del Homelab:", err);
+    alert("Error al descargar del Homelab: " + err.message);
+  } finally {
+    if (btn) btn.disabled = false;
+    if (syncBtn) syncBtn.classList.remove("is-syncing");
+  }
+}
+
+async function autoSyncHomelab(isManual = false) {
+  const btn = $("btnAutoSync");
+  const syncBtn = $("syncBtn");
+  if (btn) btn.disabled = true;
+  if (syncBtn) syncBtn.classList.add("is-syncing");
+
+  try {
+    const isOnline = await checkHomelabStatus();
+    if (!isOnline) {
+      if (isManual) alert("Homelab no disponible. Revisá que Tailscale esté conectado.");
+      return;
+    }
+
+    const localDecks = await getAllRecords("decks");
+    const res = await fetch(HOMELAB_MTG_API, { mode: "cors", signal: AbortSignal.timeout(6000) });
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    const remoteData = await res.json();
+    const hasRemote = remoteData.decks && remoteData.decks.length > 0;
+    const hasLocal = localDecks.length > 0;
+
+    // Caso 1: Servidor vacío y el celular tiene datos -> Subir copia local automáticamente
+    if (!hasRemote && hasLocal) {
+      await pushToHomelab(false);
+      if (isManual) alert(`Tu servidor estaba vacío: se respaldaron tus ${localDecks.length} mazo(s) actuales en el Homelab con éxito.`);
+      return;
+    }
+
+    // Caso 2: Celular vacío y el servidor tiene datos -> Descargar copia del servidor
+    if (!hasLocal && hasRemote) {
+      await restoreFromPayload(remoteData);
+      if (isManual) alert(`Se descargaron tus ${remoteData.decks.length} mazo(s) desde el Homelab.`);
+      return;
+    }
+
+    // Caso 3: Ambos tienen datos -> Preguntar al usuario para evitar sobrescrituras accidentales
+    if (hasLocal && hasRemote) {
+      const remoteDate = remoteData.updatedAt ? new Date(remoteData.updatedAt) : new Date(0);
+      const remoteDateStr = remoteDate.getTime() > 0 ? remoteDate.toLocaleString() : "previa";
+      
+      const choice = confirm(
+        `Homelab tiene ${remoteData.decks.length} mazos (Guardado: ${remoteDateStr}).\n` +
+        `Tu celular tiene ${localDecks.length} mazos.\n\n` +
+        `Presioná ACEPTAR para SUBIR y actualizar el Homelab con lo que tenés en este celular.\n` +
+        `O CANCELAR para mantener ambos como están (o usar los botones individuales).`
+      );
+      if (choice) {
+        await pushToHomelab(false);
+        if (isManual) alert("¡Copia del celular respaldada en el Homelab!");
+      }
+    }
+  } catch (err) {
+    console.error("Error en autoSync:", err);
+    if (isManual) alert("Error en sincronización: " + err.message);
+  } finally {
+    if (btn) btn.disabled = false;
+    if (syncBtn) syncBtn.classList.remove("is-syncing");
+  }
+}
+
+function bindSyncEvents() {
+  bindBackupEvents();
+  const syncBtn = $("syncBtn");
+  const syncDialog = $("syncDialog");
+  const btnClose = $("btnCloseSyncDialog");
+  const btnAutoSync = $("btnAutoSync");
+  const btnPush = $("btnPushToHomelab");
+  const btnPull = $("btnPullFromHomelab");
+
+  if (syncBtn && syncDialog) {
+    syncBtn.addEventListener("click", () => {
+      checkHomelabStatus();
+      syncDialog.showModal();
+    });
+  }
+  if (btnClose && syncDialog) {
+    btnClose.addEventListener("click", () => syncDialog.close());
+  }
+  if (btnAutoSync) btnAutoSync.addEventListener("click", () => autoSyncHomelab(true));
+  if (btnPush) btnPush.addEventListener("click", () => pushToHomelab(true));
+  if (btnPull) btnPull.addEventListener("click", () => pullFromHomelab());
+
+  // Verificar conexión en segundo plano
+  checkHomelabStatus();
+}
+
 function bindBackupEvents() {
   // Guardas por si algún botón no está en el DOM (evita romper el init y que no se dibujen los mazos).
   const eb = $("exportBtn");
@@ -1600,5 +1905,25 @@ function downloadBlob(blob, filename) {
     }
     
   </script>
+  <!-- ── Homelab Sync Dialog ── -->
+  <dialog id="syncDialog">
+    <div class="dialog-inner">
+      <h2 class="dialog-title">Homelab Sync</h2>
+      <div id="syncStatusBox" class="sync-status-box">
+        <span class="sync-dot" id="mtgSyncDot"></span>
+        <span id="mtgSyncStatusText">Verificando conexión...</span>
+      </div>
+      <div class="sync-info-text">
+        Servidor: mauro.taild9dcef.ts.net:8444 (Tailscale)
+      </div>
+      <div class="dialog-btn-list">
+        <button id="btnAutoSync" class="btn primary" type="button">✦ Sincronizar ahora</button>
+        <button id="btnPushToHomelab" class="btn" type="button">⬆ Subir mazos al Homelab</button>
+        <button id="btnPullFromHomelab" class="btn" type="button">⬇ Descargar mazos del Homelab</button>
+        <button id="btnCloseSyncDialog" class="btn danger" type="button">Cerrar</button>
+      </div>
+    </div>
+  </dialog>
+
 </body>
 </html>
