@@ -794,6 +794,7 @@
       bindSyncEvents();
       renderHome();
       setupBackButtonHandler();
+      autoSyncOnStart();
     }
 
     function bindEvents() {
@@ -1118,6 +1119,7 @@
         await loadDecks();
         closeDeckDialog();
         renderHome();
+        notifyDataChanged();
       } catch (err) {
         setStatus(status, err.message || "No pude crear el mazo.", true);
       }
@@ -1161,6 +1163,7 @@
         await putRecord("cards", record);
         closeCardDialog();
         await openDeck(state.currentDeck.id);
+        notifyDataChanged();
       } catch (err) {
         setStatus(status, err.message || "No pude agregar la carta.", true);
       }
@@ -1173,12 +1176,14 @@
       await deleteRecord("decks", deckId);
       await loadDecks();
       renderHome();
+      notifyDataChanged();
     }
 
     async function deleteCard(cardId) {
       if (!confirm("¿Borrar esta carta del mazo?")) return;
       await deleteRecord("cards", cardId);
       await openDeck(state.currentDeck.id);
+      notifyDataChanged();
     }
 
     // ---------- Image viewer ----------
@@ -1493,6 +1498,83 @@ async function showStorageEstimate() {
 
 const HOMELAB_MTG_API = "https://mauro.taild9dcef.ts.net:8444/api/mtg";
 const HOMELAB_HEALTH = "https://mauro.taild9dcef.ts.net:8444/api/health";
+
+let autoSyncTimeout = null;
+function notifyDataChanged() {
+  localStorage.setItem("mtg_last_local_update", Date.now());
+  const syncBtn = $("syncBtn");
+  if (syncBtn) syncBtn.classList.add("is-syncing");
+
+  clearTimeout(autoSyncTimeout);
+  autoSyncTimeout = setTimeout(async () => {
+    try {
+      console.log("Exportando cambios automáticamente al Homelab...");
+      await pushToHomelab(false);
+    } catch (e) {
+      console.warn("Fallo en auto-exportación al Homelab:", e);
+    } finally {
+      if (syncBtn) syncBtn.classList.remove("is-syncing");
+    }
+  }, 1200);
+}
+
+async function autoSyncOnStart() {
+  const syncBtn = $("syncBtn");
+  try {
+    const isOnline = await checkHomelabStatus();
+    if (!isOnline) {
+      console.log("Homelab offline en inicio. Continuando en modo local.");
+      return;
+    }
+
+    if (syncBtn) syncBtn.classList.add("is-syncing");
+
+    const localDecks = await getAllRecords("decks");
+    const res = await fetch(HOMELAB_MTG_API, { mode: "cors", signal: AbortSignal.timeout(5000) });
+    if (!res.ok) return;
+    const remoteData = await res.json();
+
+    const hasRemote = Array.isArray(remoteData.decks) && remoteData.decks.length > 0;
+    const hasLocal = localDecks.length > 0;
+
+    // Caso A: El servidor está vacío y el celular ya tiene mazos -> Exportar de inmediato al Homelab
+    if (!hasRemote && hasLocal) {
+      console.log("Homelab sin datos previos. Respaldando datos iniciales del celular...");
+      localStorage.setItem("mtg_last_local_update", Date.now());
+      await pushToHomelab(false);
+      return;
+    }
+
+    // Caso B: El celular está vacío y el servidor tiene mazos -> Importar de inmediato al celular
+    if (!hasLocal && hasRemote) {
+      console.log("Celular sin datos. Importando mazos desde el Homelab...");
+      await restoreFromPayload(remoteData);
+      localStorage.setItem("mtg_last_local_update", remoteData.updatedAt ? new Date(remoteData.updatedAt).getTime() : Date.now());
+      return;
+    }
+
+    // Caso C: Ambos tienen datos -> Comparar timestamps
+    if (hasLocal && hasRemote) {
+      const remoteTime = remoteData.updatedAt ? new Date(remoteData.updatedAt).getTime() : 0;
+      const localTime = parseInt(localStorage.getItem("mtg_last_local_update") || "0", 10);
+
+      // Si el servidor tiene datos más recientes que el celular, importamos
+      if (remoteTime > localTime) {
+        console.log("El Homelab tiene una versión más reciente. Sincronizando al celular...");
+        await restoreFromPayload(remoteData);
+        localStorage.setItem("mtg_last_local_update", remoteTime);
+      } else if (localTime > remoteTime) {
+        // Si el celular tiene cambios más recientes (ej. hechos offline), subimos al servidor
+        console.log("El celular tiene cambios más recientes. Actualizando el Homelab...");
+        await pushToHomelab(false);
+      }
+    }
+  } catch (err) {
+    console.warn("AutoSync en inicio no pudo completarse:", err);
+  } finally {
+    if (syncBtn) syncBtn.classList.remove("is-syncing");
+  }
+}
 
 async function checkHomelabStatus() {
   const dot = $("mtgSyncDot");
