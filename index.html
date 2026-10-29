@@ -1496,13 +1496,9 @@ async function showStorageEstimate() {
 }
     // ---------- Backup / Restore ----------
 
-const HOMELAB_CANDIDATES = [
-  "https://100.79.49.7:8444",
-  "https://mauro.taild9dcef.ts.net:8444"
-];
-let activeMtgBase = localStorage.getItem("mtg_api_base") || HOMELAB_CANDIDATES[0];
-function getMtgApiUrl() { return `${activeMtgBase}/api/mtg`; }
-function getMtgHealthUrl() { return `${activeMtgBase}/api/health`; }
+const HOMELAB_MTG_BASE = "https://mauro.taild9dcef.ts.net:8444";
+function getMtgApiUrl() { return `${HOMELAB_MTG_BASE}/api/mtg`; }
+function getMtgHealthUrl() { return `${HOMELAB_MTG_BASE}/api/health`; }
 
 let autoSyncTimeout = null;
 function notifyDataChanged() {
@@ -1585,20 +1581,15 @@ async function checkHomelabStatus() {
   const dot = $("mtgSyncDot");
   const text = $("mtgSyncStatusText");
   const btn = $("syncBtn");
-  const candidates = [activeMtgBase, ...HOMELAB_CANDIDATES.filter(u => u !== activeMtgBase)];
-  for (const base of candidates) {
-    try {
-      const res = await fetch(`${base}/api/health`, { mode: "cors", signal: AbortSignal.timeout(3000) });
-      if (res.ok) {
-        activeMtgBase = base;
-        localStorage.setItem("mtg_api_base", base);
-        if (dot) dot.className = "sync-dot is-online";
-        if (text) text.textContent = "Homelab conectado (Tailscale)";
-        if (btn) btn.classList.add("is-online");
-        return true;
-      }
-    } catch (_) {}
-  }
+  try {
+    const res = await fetch(getMtgHealthUrl(), { mode: "cors", signal: AbortSignal.timeout(4000) });
+    if (res.ok) {
+      if (dot) dot.className = "sync-dot is-online";
+      if (text) text.textContent = "Homelab conectado (Tailscale)";
+      if (btn) btn.classList.add("is-online");
+      return true;
+    }
+  } catch (_) {}
   if (dot) dot.className = "sync-dot is-offline";
   if (text) text.textContent = "Homelab no disponible (revisá Tailscale)";
   if (btn) btn.classList.remove("is-online");
